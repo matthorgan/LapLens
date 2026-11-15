@@ -1,4 +1,5 @@
 import { projectPathFor } from "../core/project";
+import { frameSecondsFromMoov } from "../core/video";
 
 export function inTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -30,6 +31,50 @@ export async function openVbo(): Promise<{ path: string; name: string; text: str
   const file = await pickFile(".vbo");
   if (!file) return null;
   return { path: file.name, name: file.name, text: await file.text() };
+}
+
+export async function openVideo(): Promise<{ path: string; url: string; file: File | null } | null> {
+  if (inTauri()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({
+      multiple: false,
+      filters: [{ name: "GoPro video", extensions: ["mp4", "mov", "lrv"] }],
+    });
+    if (typeof picked !== "string") return null;
+    const { convertFileSrc } = await import("@tauri-apps/api/core");
+    return { path: picked, url: convertFileSrc(picked), file: null };
+  }
+  const file = await pickFile("video/mp4,video/quicktime,.mp4,.mov,.lrv");
+  if (!file) return null;
+  return { path: file.name, url: URL.createObjectURL(file), file };
+}
+
+export function lrvCandidates(path: string): string[] {
+  if (/\.lrv$/i.test(path)) return [];
+  const stem = path.replace(/\.[^./\\]+$/, "");
+  if (stem === path) return [];
+  return [`${stem}.LRV`, `${stem}.lrv`];
+}
+
+export async function frameSecondsForPath(path: string): Promise<number | null> {
+  if (!inTauri() || !isFilesystemPath(path)) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  const encoded = await invoke<string | null>("read_moov_base64", { path });
+  if (!encoded) return null;
+  return frameSecondsFromMoov(decodeBase64(encoded));
+}
+
+function decodeBase64(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+export async function fileExists(path: string): Promise<boolean> {
+  if (!inTauri() || !isFilesystemPath(path)) return false;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<boolean>("file_exists", { path });
 }
 
 export async function openProjectFile(): Promise<{ name: string; text: string } | null> {

@@ -32,16 +32,25 @@ export function parseProject(text: string): ProjectFile {
     hiddenLapIds: Array.isArray(data.hiddenLapIds)
       ? data.hiddenLapIds.filter((id): id is number => typeof id === "number")
       : [],
-    videos: Array.isArray(data.videos) ? data.videos.filter(isVideo) : [],
+    videos: Array.isArray(data.videos)
+      ? data.videos.flatMap((value) => {
+          const clip = toVideo(value);
+          return clip ? [clip] : [];
+        })
+      : [],
   };
 }
 
-function isVideo(value: unknown): value is VideoClip {
-  if (!value || typeof value !== "object") return false;
+function toVideo(value: unknown): VideoClip | null {
+  if (!value || typeof value !== "object") return null;
   const clip = value as Partial<VideoClip>;
-  return (
-    typeof clip.path === "string" &&
-    typeof clip.syncDataTime === "number" &&
-    typeof clip.syncVideoTime === "number"
-  );
+  if (typeof clip.path !== "string" || clip.path.length === 0) return null;
+  const syncDataTime = typeof clip.syncDataTime === "number" ? clip.syncDataTime : null;
+  const syncVideoTime = typeof clip.syncVideoTime === "number" ? clip.syncVideoTime : null;
+  const synced = syncDataTime != null && syncVideoTime != null;
+  return {
+    path: clip.path,
+    syncDataTime: synced ? syncDataTime : null,
+    syncVideoTime: synced ? syncVideoTime : null,
+  };
 }

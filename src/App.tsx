@@ -4,11 +4,24 @@ import { channelAtDistance, detectLaps, distanceAtTime, fastestLap, timeAtDistan
 import { createProject, parseProject, projectPathFor, serializeProject } from "./core/project";
 import type { Lap, ProjectFile, Session } from "./core/types";
 import { parseVbo } from "./core/vbo";
-import { isFilesystemPath, openProjectFile, openVbo, readOptionalText, saveProjectFile } from "./lib/files";
+import { frameSecondsFromBlob } from "./core/video";
+import {
+  fileExists,
+  frameSecondsForPath,
+  inTauri,
+  isFilesystemPath,
+  lrvCandidates,
+  openProjectFile,
+  openVbo,
+  openVideo,
+  readOptionalText,
+  saveProjectFile,
+} from "./lib/files";
 import { Charts } from "./ui/Charts";
 import { LapTable } from "./ui/LapTable";
 import { MapView } from "./ui/MapView";
 import { Transport } from "./ui/Transport";
+import { VideoPane } from "./ui/VideoPane";
 
 type Loaded = {
   session: Session;
@@ -21,12 +34,22 @@ type Notice = {
   text: string;
 };
 
+type Playback = {
+  path: string;
+  url: string;
+  frameSeconds: number;
+  preview: boolean;
+};
+
 export function App() {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [cursor, setCursor] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [playback, setPlayback] = useState<Playback | null>(null);
+  const playbackRef = useRef<Playback | null>(null);
+  playbackRef.current = playback;
   const cursorRef = useRef(0);
   const domainRef = useRef(0);
 
@@ -59,6 +82,10 @@ export function App() {
     setCursor(0);
     setPlaying(false);
     setSelectedId(null);
+    setPlayback((current) => {
+      if (current?.url.startsWith("blob:")) URL.revokeObjectURL(current.url);
+      return null;
+    });
     setLoaded({ session, laps, project });
     setNotice(sidecarError ? { kind: "error", text: sidecarError } : null);
   }, []);
@@ -89,6 +116,33 @@ export function App() {
       cancel = true;
     };
   }, [loadText]);
+
+  const clipPath = loaded?.project.videos[0]?.path ?? "";
+  useEffect(() => {
+    const current = playbackRef.current;
+    if (!clipPath) return;
+    if (current?.path === clipPath) return;
+    if (!(inTauri() && isFilesystemPath(clipPath))) return;
+    let cancel = false;
+    void import("@tauri-apps/api/core").then(({ convertFileSrc }) => {
+      if (cancel) return;
+      setPlayback({
+        path: clipPath,
+        url: convertFileSrc(clipPath),
+        frameSeconds: 1 / 60,
+        preview: false,
+      });
+    });
+    void frameSecondsForPath(clipPath).then((seconds) => {
+      if (cancel || seconds == null) return;
+      setPlayback((prev) =>
+        prev && prev.path === clipPath && !prev.preview ? { ...prev, frameSeconds: seconds } : prev,
+      );
+    });
+    return () => {
+      cancel = true;
+    };
+  }, [clipPath]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -191,6 +245,113 @@ export function App() {
     });
   };
 
+  async function openVideoFile() {
+    setNotice(null);
+    try {
+      const picked = await openVideo();
+      if (!picked) return;
+      const measured = picked.file
+        ? await frameSecondsFromBlob(picked.file)
+        : await frameSecondsForPath(picked.path);
+      setPlayback((current) => {
+        if (current?.url.startsWith("blob:") && current.url !== picked.url) URL.revokeObjectURL(current.url);
+        return {
+          path: picked.path,
+          url: picked.url,
+          frameSeconds: measured && measured > 0 ? measured : 1 / 60,
+          preview: false,
+        };
+      });
+      setLoaded((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          project: {
+            ...prev.project,
+            videos: [{ path: picked.path, syncDataTime: null, syncVideoTime: null }],
+          },
+        };
+      });
+    } catch (err) {
+      setNotice({
+        kind: "error",
+        text: err instanceof Error ? err.message : "Could not open that video",
+      });
+    }
+  }
+
+  function markCrossing(syncVideoTime: number) {
+    const first = loaded?.laps[0];
+    if (!first) return;
+    setLoaded((prev) => {
+      const clip = prev?.project.videos[0];
+      if (!prev || !clip) return prev;
+      return {
+        ...prev,
+        project: {
+          ...prev.project,
+          videos: [{ path: clip.path, syncDataTime: first.startElapsed, syncVideoTime }],
+        },
+      };
+    });
+    setNotice({ kind: "info", text: "Lined up with the first start/finish crossing" });
+  }
+
+  function nudgeSync(seconds: number) {
+    setLoaded((prev) => {
+      const clip = prev?.project.videos[0];
+      if (!prev || !clip || clip.syncVideoTime == null) return prev;
+      return {
+        ...prev,
+        project: {
+          ...prev.project,
+          videos: [{ ...clip, syncVideoTime: Math.max(0, clip.syncVideoTime + seconds) }],
+        },
+      };
+    });
+  }
+
+  function clearSync() {
+    setLoaded((prev) => {
+      const clip = prev?.project.videos[0];
+      if (!prev || !clip) return prev;
+      return {
+        ...prev,
+        project: {
+          ...prev.project,
+          videos: [{ ...clip, syncDataTime: null, syncVideoTime: null }],
+        },
+      };
+    });
+  }
+
+  async function handlePlaybackError(failedUrl: string) {
+    const current = playbackRef.current;
+    const clip = loaded?.project.videos[0];
+    if (!current || current.url !== failedUrl) return;
+    try {
+      if (!current.preview && clip) {
+        for (const candidate of lrvCandidates(clip.path)) {
+          if (await fileExists(candidate)) {
+            const { convertFileSrc } = await import("@tauri-apps/api/core");
+            setPlayback({ ...current, url: convertFileSrc(candidate), preview: true });
+            setNotice({
+              kind: "info",
+              text: "The full video did not play, so this is the low-resolution preview.",
+            });
+            return;
+          }
+        }
+      }
+    } catch {
+      // The desktop window has to be restarted before the new file commands exist.
+    }
+    setNotice({
+      kind: "error",
+      text: "This video did not play. A GoPro HEVC file needs the Windows HEVC extension, or the .LRV preview saved beside the MP4.",
+    });
+  }
+
   async function openFile() {
     setNotice(null);
     try {
@@ -276,6 +437,9 @@ export function App() {
           <button type="button" onClick={() => void openFile()}>
             Open VBO
           </button>
+          <button type="button" onClick={() => void openVideoFile()} disabled={!loaded}>
+            Open video
+          </button>
           <button type="button" onClick={() => void saveSession()} disabled={!loaded}>
             Save session
           </button>
@@ -341,6 +505,23 @@ export function App() {
           ) : (
             <div className="charts empty-copy">Select a lap to plot speed and delta.</div>
           )}
+          <VideoPane
+            clip={loaded.project.videos[0] ?? null}
+            url={playback && playback.path === (loaded.project.videos[0]?.path ?? "") ? playback.url : null}
+            frameSeconds={playback?.frameSeconds ?? 1 / 60}
+            usingPreview={playback?.preview ?? false}
+            laps={loaded.laps}
+            reference={reference}
+            comparison={comparison}
+            cursor={cursor}
+            playing={playing}
+            onOpen={() => void openVideoFile()}
+            onMark={markCrossing}
+            onNudge={nudgeSync}
+            onClear={clearSync}
+            onPause={() => setPlaying(false)}
+            onPlaybackError={(url) => void handlePlaybackError(url)}
+          />
         </main>
       ) : (
         <main className="welcome">

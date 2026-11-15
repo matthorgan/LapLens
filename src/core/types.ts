@@ -49,8 +49,8 @@ export type Lap = {
 
 export type VideoClip = {
   path: string;
-  syncDataTime: number;
-  syncVideoTime: number;
+  syncDataTime: number | null;
+  syncVideoTime: number | null;
 };
 
 export type ProjectFile = {

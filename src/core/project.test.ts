@@ -18,6 +18,19 @@ describe("project file", () => {
     );
   });
 
+  it("keeps a video path before it is synced", () => {
+    const parsed = parseProject(
+      JSON.stringify({
+        version: 1,
+        source: { path: "a.vbo", name: "a.vbo" },
+        videos: [{ path: "GOPR.MP4" }],
+      }),
+    );
+    expect(parsed.videos).toEqual([
+      { path: "GOPR.MP4", syncDataTime: null, syncVideoTime: null },
+    ]);
+  });
+
   it("rejects a future file version", () => {
     expect(() => parseProject('{"version":2}')).toThrow(/Unsupported/);
   });
